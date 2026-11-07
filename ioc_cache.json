@@ -1,0 +1,38 @@
+{
+  "0f506286602cc050ce45389a9dd0d2aa95313003e7f483d4db0bd70af82c7b54": {
+    "ioc": "0F506286602CC050CE45389A9DD0D2AA95313003E7F483D4DB0BD70AF82C7B54",
+    "type": "hash",
+    "score": "33 out of 74",
+    "verdict": "MALICIOUS"
+  },
+  "98791dd43a80cce4259b4f58756d6ce1ef57acb53535db65f717ee3c6cfaa97d": {
+    "ioc": "98791DD43A80CCE4259B4F58756D6CE1EF57ACB53535DB65F717EE3C6CFAA97D",
+    "type": "hash",
+    "score": "N/A",
+    "verdict": "NOT_FOUND"
+  },
+  "https://edocument678844incident936832mayo.urbansrow.us/incidental594712advertorial935wiggle/": {
+    "ioc": "https://edocument678844incident936832mayo.urbansrow.us/incidental594712advertorial935wiggle/",
+    "type": "url",
+    "score": "2 out of 91",
+    "verdict": "MALICIOUS"
+  },
+  "fancxj.demolizionibelvedere.com": {
+    "ioc": "fancxj[.]demolizionibelvedere[.]com",
+    "type": "domain",
+    "score": "0 out of 91",
+    "verdict": "CLEAN"
+  },
+  "noreply@asiansender.xobqg.com": {
+    "ioc": "noreply[@]asiansender[.]xobqg[.]com",
+    "type": "domain",
+    "score": "0 out of 91",
+    "verdict": "CLEAN"
+  },
+  "3cf7807c9394f4fcebf6708a3ce1134fbc7d396fcd0f6cacaa512160dd2c2e3b": {
+    "ioc": "3CF7807C9394F4FCEBF6708A3CE1134FBC7D396FCD0F6CACAA512160DD2C2E3B",
+    "type": "hash",
+    "score": "16 out of 75",
+    "verdict": "MALICIOUS"
+  }
+}
