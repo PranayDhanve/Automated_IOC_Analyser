@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
+import argparse
 import base64
 import csv
 import ipaddress
@@ -8,319 +11,381 @@ import os
 import re
 import sys
 import time
+import zipfile
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
+from openpyxl import load_workbook
 
-load_dotenv()
 
-INPUT_CSV = "sample_iocs.csv"
-OUTPUT_CSV = "scan_results.csv"
-CACHE_FILE = "ioc_cache.json"
-VT_DELAY_SECONDS = 15  
 VT_BASE = "https://www.virustotal.com/api/v3"
+CACHE_VERSION = 1
+DEFAULT_DELAY_SECONDS = 15.0
+DEFAULT_CACHE_TTL_HOURS = 168.0
+KNOWN_COLUMNS = {"ioc", "indicator", "indicators", "hash", "url", "domain", "ip", "value"}
+DOMAIN_PATTERN = re.compile(
+    r"(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
+)
 
 
-api_key = os.getenv("Vir_ttl_API")
-if not api_key:
-    print(
-        "ERROR: VirusTotal API key not found.\n"
-        "  → Set 'Vir_ttl_API' in your .env file or as an environment variable.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+class RateLimitedError(RuntimeError):
+    """Raised when VirusTotal asks the scanner to slow down."""
 
-headers = {
-    "x-apikey": api_key,
-    "accept": "application/json",
-}
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"VirusTotal rate limited this scan; retry after {retry_after} seconds.")
+        self.retry_after = retry_after
 
-# Caching
 
-def cache_key(ioc: str) -> str:
-    """Normalize IOC for caching (refang, lower)."""
-    return refang(ioc.strip()).lower()
+@dataclass(frozen=True)
+class Settings:
+    input_path: Path
+    output_path: Path
+    cache_path: Path
+    delay_seconds: float
+    cache_ttl: timedelta
 
-def load_cache(filepath: str) -> dict:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
 
-def save_cache(filepath: str, cache_data: dict) -> None:
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, indent=2)
-    except OSError as e:
-        print(f"  [!] Failed to save cache: {e}")
+@dataclass
+class ScanSummary:
+    """Results and operational counts from one scan."""
 
-# Defanging / Classification 
+    results: list[dict[str, str]]
+    output_path: Path
+    api_calls: int
+    cached_count: int
+    invalid_count: int
+    rate_limited_retry_after: int | None = None
+
 
 def refang(value: str) -> str:
-    """Convert  to their real form."""
-    value = value.replace("[.]", ".").replace("(.)",".")
-    value = value.replace("[@]", "@").replace("(@)","@")
-    value = value.replace("hxxp://", "http://").replace("hxxps://", "https://")
-    value = value.replace("hXXp://", "http://").replace("hXXps://", "https://")
+    """Convert common defanged URL, domain, and email forms to standard syntax."""
+    value = value.replace("[.]", ".").replace("(.)", ".")
+    value = value.replace("[@]", "@").replace("(@)", "@")
+    value = re.sub(r"(?i)^hxxps://", "https://", value)
+    value = re.sub(r"(?i)^hxxp://", "http://", value)
     return value.strip()
 
 
+def _is_domain(value: str) -> bool:
+    return bool(DOMAIN_PATTERN.fullmatch(value.rstrip(".")))
+
+
 def classify_ioc(raw: str) -> tuple[str, str]:
-    """  Types: hash, url, domain, ip, email  """
-    
-    value = refang(raw.strip())
+    """Classify and normalize a hash, URL, domain, IP address, or email IOC."""
+    value = refang(raw)
     if not value:
-        raise ValueError("Please give IOCs ")
+        raise ValueError("empty IOC")
 
-    lower = value.lower()
-
-    # URLs
-    if lower.startswith(("http://", "https://")):
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://")):
+        parsed = requests.utils.urlparse(value)
+        if not parsed.netloc:
+            raise ValueError(f"invalid URL: {value!r}")
         return "url", value
 
-    # Hashes: MD5 (32), SHA-1 (40), SHA-256 (64)
-    if re.fullmatch(r"[A-Fa-f0-9]{32}", value):
-        return "hash", value.lower()
-    if re.fullmatch(r"[A-Fa-f0-9]{40}", value):
-        return "hash", value.lower()
-    if re.fullmatch(r"[A-Fa-f0-9]{64}", value):
-        return "hash", value.lower()
+    if re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}", value):
+        return "hash", lowered
 
-    # Email addresses → extract and scan the domain
     if "@" in value:
-        domain_part = value.split("@", 1)[1].strip()
-        if domain_part:
-            return "domain", domain_part.lower()
+        local, separator, domain = value.rpartition("@")
+        if not separator or not local or not _is_domain(domain):
+            raise ValueError(f"invalid email IOC: {value!r}")
+        return "domain", domain.rstrip(".").lower()
 
-    # IP addresses
     try:
         ipaddress.ip_address(value)
         return "ip", value
     except ValueError:
         pass
 
-    # Domain / hostname
-    host = value.rstrip(".")
-    if re.fullmatch(
-        r"(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
-        host,
-    ):
-        return "domain", host.lower()
-
+    if _is_domain(value):
+        return "domain", value.rstrip(".").lower()
     raise ValueError(f"unrecognized IOC type: {value!r}")
 
 
+def cache_key(ioc_type: str, normalized_ioc: str) -> str:
+    """Create a canonical cache key after IOC classification."""
+    return f"{ioc_type}:{normalized_ioc.lower()}"
+
 
 def vt_url_id(url: str) -> str:
-    """VirusTotal URL identifier: URL-safe base64 without padding."""
+    """Return VirusTotal's URL-safe base64 identifier for a URL."""
     return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def vt_endpoint(ioc_type: str, value: str) -> str:
-    """Return the correct VT v3 endpoint for a given IOC type."""
+    """Return the VirusTotal v3 endpoint for a normalized IOC."""
     endpoints = {
-        "hash":   f"{VT_BASE}/files/{value}",
-        "ip":     f"{VT_BASE}/ip_addresses/{value}",
+        "hash": f"{VT_BASE}/files/{value}",
+        "ip": f"{VT_BASE}/ip_addresses/{value}",
         "domain": f"{VT_BASE}/domains/{value}",
-        "url":    f"{VT_BASE}/urls/{vt_url_id(value)}",
+        "url": f"{VT_BASE}/urls/{vt_url_id(value)}",
     }
-    if ioc_type not in endpoints:
-        raise ValueError(f"unknown IOC type: {ioc_type}")
-    return endpoints[ioc_type]
+    try:
+        return endpoints[ioc_type]
+    except KeyError as exc:
+        raise ValueError(f"unknown IOC type: {ioc_type}") from exc
 
 
-# CSV I/O 
+def _ioc_column(fieldnames: list[str]) -> str:
+    for column in fieldnames:
+        if column.strip().lower() in KNOWN_COLUMNS:
+            return column
+    return fieldnames[0]
 
-KNOWN_COLUMNS = {"ioc", "indicator", "indicators", "hash", "url", "domain", "ip", "value"}
 
-def read_iocs(filepath: str) -> list[str]:
-    """Read IOCs from a CSV. Auto-detects the IOC column by header name."""
-    iocs = []
-    with open(filepath, mode="r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+def _read_csv(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
         if not reader.fieldnames:
-            return iocs
-        
-        # Find the IOC column (first column whose header matches a known name)
-        ioc_col = None
-        for col in reader.fieldnames:
-            if col.strip().lower() in KNOWN_COLUMNS:
-                ioc_col = col
-                break
-
-        # Fallback: use the first column
-        if ioc_col is None:
-            ioc_col = reader.fieldnames[0]
-
-        for row in reader:
-            val = row.get(ioc_col, "").strip()
-            if val:
-                iocs.append(val)
-    return iocs
+            return []
+        column = _ioc_column(reader.fieldnames)
+        return [row.get(column, "").strip() for row in reader if row.get(column, "").strip()]
 
 
-def write_results(filepath: str, rows: list[dict]) -> str:
-    import pathlib, datetime
-    base = pathlib.Path(filepath)
-    candidates = [base] + [base.with_stem(f"{base.stem}_{i}") for i in range(1, 6)]
-    for path in candidates:
+def _read_xlsx(path: Path) -> list[str]:
+    # Pass a binary stream so valid workbooks remain readable even when users
+    # have given them an incorrect .csv extension.
+    with path.open("rb") as handle:
+        workbook = load_workbook(handle, read_only=True, data_only=True)
         try:
-            with open(path, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=["ioc", "type", "score", "verdict"])
-                writer.writeheader()
-                writer.writerows(rows)
-            if str(path) != filepath:
-                print(f"  [!] {filepath} is locked, wrote to {path} instead")
-            return str(path)
-        except PermissionError:
-            continue
-    # Last resort: timestamped file
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    fallback = base.with_stem(f"{base.stem}_{ts}")
-    with open(fallback, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["ioc", "type", "score", "verdict"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"  [!] {filepath} is locked, wrote to {fallback} instead")
-    return str(fallback)
+            sheet = workbook.active
+            rows = sheet.iter_rows(values_only=True)
+            header = next(rows, None)
+            if not header:
+                return []
+            fieldnames = [str(value).strip() if value is not None else "" for value in header]
+            column = _ioc_column(fieldnames)
+            column_index = fieldnames.index(column)
+            return [str(row[column_index]).strip() for row in rows if len(row) > column_index and row[column_index] is not None and str(row[column_index]).strip()]
+        finally:
+            workbook.close()
 
 
-# Scoring 
+def read_iocs(filepath: str | Path) -> list[str]:
+    """Read IOCs from a UTF-8 CSV or an XLSX workbook, regardless of suffix."""
+    path = Path(filepath)
+    if not path.is_file():
+        raise FileNotFoundError(f"input file not found: {path}")
+    if path.suffix.lower() in {".xlsx", ".xlsm"} or zipfile.is_zipfile(path):
+        return _read_xlsx(path)
+    return _read_csv(path)
 
-def format_score(stats: dict) -> tuple[str, str]:
-    """
-    Convert last_analysis_stats into a human-readable score and verdict.
-    Returns ("malicious/total", verdict)
-    """
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def load_cache(filepath: Path) -> dict[str, dict[str, Any]]:
+    """Load a versioned cache. Invalid or legacy cache data is safely ignored."""
+    if not filepath.exists():
+        return {}
+    try:
+        with filepath.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("version") != CACHE_VERSION or not isinstance(payload.get("entries"), dict):
+            print(f"  [!] Ignoring unsupported cache format: {filepath}", file=sys.stderr)
+            return {}
+        return payload["entries"]
+    except (json.JSONDecodeError, OSError, AttributeError) as exc:
+        print(f"  [!] Ignoring unreadable cache {filepath}: {exc}", file=sys.stderr)
+        return {}
+
+
+def save_cache(filepath: Path, entries: dict[str, dict[str, Any]]) -> None:
+    """Atomically save the versioned cache without risking partial JSON writes."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    temporary = filepath.with_suffix(f"{filepath.suffix}.tmp")
+    payload = {"version": CACHE_VERSION, "entries": entries}
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(temporary, filepath)
+
+
+def cached_result(entry: dict[str, Any] | None, ttl: timedelta) -> dict[str, str] | None:
+    """Return a non-expired cached result, or None when it must be refreshed."""
+    if not entry:
+        return None
+    try:
+        cached_at = datetime.fromisoformat(entry["cached_at"])
+        result = entry["result"]
+        if cached_at.tzinfo is None or _utc_now() - cached_at > ttl:
+            return None
+        if not isinstance(result, dict):
+            return None
+        return result
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def format_score(stats: dict[str, Any]) -> tuple[str, str]:
+    """Convert VirusTotal analysis statistics into a score and verdict."""
     malicious = int(stats.get("malicious", 0))
     suspicious = int(stats.get("suspicious", 0))
-    total = sum(int(v) for v in stats.values())
-
-    score = f"{malicious} out of {total}"
-
-    if malicious > 0:
+    total = sum(int(value) for value in stats.values())
+    if malicious:
         verdict = "MALICIOUS"
-    elif suspicious > 0:
+    elif suspicious:
         verdict = "SUSPICIOUS"
     else:
         verdict = "CLEAN"
-
-    return score, verdict
-
-
-# Lookup 
-
-def lookup_ioc(raw_ioc: str) -> dict:
-    """Query VirusTotal for a single IOC and return the result row."""
-    result = {"ioc": raw_ioc, "type": "unknown", "score": "N/A", "verdict": "ERROR"}
-
-    try:
-        ioc_type, normalized = classify_ioc(raw_ioc)
-    except ValueError as exc:
-        result["verdict"] = f"ERROR: {exc}"
-        return result
-
-    result["type"] = ioc_type
-    url = vt_endpoint(ioc_type, normalized)
-
-    try:
-        response = requests.get(url, headers=headers, timeout=60)
-    except requests.RequestException as exc:
-        print(f"  [!] Network error: {exc}")
-        result["verdict"] = f"ERROR: {exc}"
-        return result
-
-    if response.status_code == 404:
-        result["verdict"] = "NOT_FOUND"
-        return result
-
-    if response.status_code == 429:
-        result["verdict"] = "RATE_LIMITED"
-        return result
-
-    if response.status_code != 200:
-        msg = f"HTTP {response.status_code}"
-        print(f"  [!] {msg}")
-        result["verdict"] = f"ERROR: {msg}"
-        return result
-
-    try:
-        stats = response.json()["data"]["attributes"]["last_analysis_stats"]
-        result["score"], result["verdict"] = format_score(stats)
-    except (KeyError, TypeError, ValueError) as exc:
-        print(f"  [!] Parse error: {exc}")
-        result["verdict"] = f"ERROR: bad response ({exc})"
-
-    return result
+    return f"{malicious} out of {total}", verdict
 
 
-# Main 
+class VirusTotalClient:
+    """Small reusable VirusTotal HTTP client with explicit rate-limit handling."""
 
-def main() -> None:
-    ioc_list = read_iocs(INPUT_CSV)
-    if not ioc_list:
-        print(f"No IOCs found in {INPUT_CSV}.", file=sys.stderr)
-        sys.exit(1)
+    def __init__(self, api_key: str, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+        self.headers = {"x-apikey": api_key, "accept": "application/json"}
 
-    # Load persistent cache
-    cache = load_cache(CACHE_FILE)
-    cached_count = sum(1 for ioc in ioc_list if cache_key(ioc) in cache)
-    to_scan = len(ioc_list) - cached_count
-
-    print(f"Loaded {len(ioc_list)} IOC(s) from {INPUT_CSV}")
-    print(f"  {cached_count} found in cache, {to_scan} need API lookup")
-    if to_scan > 0:
-        est_min = (to_scan * VT_DELAY_SECONDS) / 60
-        print(f"  Estimated time: ~{est_min:.1f} minutes (free-tier rate limit)")
-    print()
-
-    results: list[dict] = []
-    api_calls_made = 0
-
-    for idx, raw_ioc in enumerate(ioc_list, start=1):
-        # Classify for display
+    def lookup(self, raw_ioc: str, ioc_type: str, normalized_ioc: str) -> dict[str, str]:
+        result = {"ioc": raw_ioc, "type": ioc_type, "score": "N/A", "verdict": "ERROR"}
         try:
-            ioc_type, _ = classify_ioc(raw_ioc)
-            label = ioc_type.upper()
-        except ValueError:
-            label = "???"
+            response = self.session.get(vt_endpoint(ioc_type, normalized_ioc), headers=self.headers, timeout=30)
+        except requests.RequestException as exc:
+            result["verdict"] = f"ERROR: network failure ({exc.__class__.__name__})"
+            return result
+        if response.status_code == 404:
+            result["verdict"] = "NOT_FOUND"
+            return result
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "60")
+            try:
+                seconds = max(1, int(retry_after))
+            except ValueError:
+                seconds = 60
+            raise RateLimitedError(seconds)
+        if response.status_code != 200:
+            result["verdict"] = f"ERROR: HTTP {response.status_code}"
+            return result
+        try:
+            stats = response.json()["data"]["attributes"]["last_analysis_stats"]
+            result["score"], result["verdict"] = format_score(stats)
+        except (KeyError, TypeError, ValueError, requests.JSONDecodeError):
+            result["verdict"] = "ERROR: invalid VirusTotal response"
+        return result
 
-        display = raw_ioc if len(raw_ioc) <= 50 else raw_ioc[:47] + "..."
-        key = cache_key(raw_ioc)
 
-        # Check cache first
-        if key in cache:
-            row = cache[key].copy()
-            row["ioc"] = raw_ioc  # preserve original formatting
-            results.append(row)
-            print(f"[{idx}/{len(ioc_list)}] [{label}] {display} -> {row['score']}  ({row['verdict']})  [CACHED]")
+def write_results(filepath: Path, rows: list[dict[str, str]]) -> Path:
+    """Atomically write results, choosing a nearby fallback when the file is locked."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    candidates = [filepath] + [filepath.with_stem(f"{filepath.stem}_{index}") for index in range(1, 6)]
+    for candidate in candidates:
+        temporary = candidate.with_suffix(f"{candidate.suffix}.tmp")
+        try:
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["ioc", "type", "score", "verdict"])
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(temporary, candidate)
+            return candidate
+        except PermissionError:
+            temporary.unlink(missing_ok=True)
+    timestamp = _utc_now().strftime("%Y%m%d_%H%M%S")
+    fallback = filepath.with_stem(f"{filepath.stem}_{timestamp}")
+    with fallback.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["ioc", "type", "score", "verdict"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return fallback
+
+
+def parse_args(argv: list[str] | None = None) -> Settings:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=Path("sample_iocs.csv"), help="CSV or XLSX IOC input file")
+    parser.add_argument("--output", type=Path, default=Path("output/scan_results.csv"), help="results CSV path")
+    parser.add_argument("--cache", type=Path, default=Path(".cache/ioc_cache.json"), help="persistent cache path")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS, help="seconds between API calls")
+    parser.add_argument("--cache-ttl-hours", type=float, default=DEFAULT_CACHE_TTL_HOURS, help="maximum age of cached results")
+    args = parser.parse_args(argv)
+    if args.delay < 0 or args.cache_ttl_hours <= 0:
+        parser.error("--delay must be non-negative and --cache-ttl-hours must be positive")
+    return Settings(args.input, args.output, args.cache, args.delay, timedelta(hours=args.cache_ttl_hours))
+
+
+def get_api_key() -> str:
+    
+    load_dotenv()
+    return os.getenv("Vir_ttl_API") or ""
+
+
+def scan_iocs(
+    iocs: list[str], settings: Settings, client: VirusTotalClient
+) -> ScanSummary:
+    """Scan classified IOCs, checkpointing every result and stopping on HTTP 429."""
+    cache = load_cache(settings.cache_path)
+    results: list[dict[str, str]] = []
+    api_calls = cached_count = invalid_count = 0
+    result_path = settings.output_path
+
+    for raw_ioc in iocs:
+        try:
+            ioc_type, normalized = classify_ioc(raw_ioc)
+        except ValueError as exc:
+            invalid_count += 1
+            results.append({"ioc": raw_ioc, "type": "unknown", "score": "N/A", "verdict": f"ERROR: {exc}"})
+            result_path = write_results(settings.output_path, results)
             continue
 
-        # Rate-limit: wait before API calls (skip for first one)
-        if api_calls_made > 0:
-            time.sleep(VT_DELAY_SECONDS)
+        key = cache_key(ioc_type, normalized)
+        cached = cached_result(cache.get(key), settings.cache_ttl)
+        if cached:
+            results.append({**cached, "ioc": raw_ioc})
+            cached_count += 1
+            result_path = write_results(settings.output_path, results)
+            continue
 
-        print(f"[{idx}/{len(ioc_list)}] [{label}] {display}", end=" ")
-        
-        row = lookup_ioc(raw_ioc)
+        if api_calls:
+            time.sleep(settings.delay_seconds)
+        try:
+            row = client.lookup(raw_ioc, ioc_type, normalized)
+        except RateLimitedError as exc:
+            results.append({"ioc": raw_ioc, "type": ioc_type, "score": "N/A", "verdict": "RATE_LIMITED"})
+            result_path = write_results(settings.output_path, results)
+            return ScanSummary(results, result_path, api_calls, cached_count, invalid_count, exc.retry_after)
+
+        api_calls += 1
         results.append(row)
-        api_calls_made += 1
-        print(f"-> {row['score']}  ({row['verdict']})")
+        if not row["verdict"].startswith("ERROR"):
+            cache[key] = {"cached_at": _utc_now().isoformat(), "result": row}
+            save_cache(settings.cache_path, cache)
+        result_path = write_results(settings.output_path, results)
 
-        # Save to cache (skip errors that are worth retrying)
-        if row["verdict"] not in ("RATE_LIMITED",) and not row["verdict"].startswith("ERROR"):
-            cache[key] = {"ioc": raw_ioc, "type": row["type"], "score": row["score"], "verdict": row["verdict"]}
-            save_cache(CACHE_FILE, cache)
+    return ScanSummary(results, result_path, api_calls, cached_count, invalid_count)
 
-        # Checkpoint after every lookup
-        write_results(OUTPUT_CSV, results)
 
-    print(f"\nDone. {api_calls_made} API call(s) made, {cached_count} served from cache.")
-    print(f"Results written to {OUTPUT_CSV}")
+def main(argv: list[str] | None = None) -> int:
+    settings = parse_args(argv)
+    api_key = get_api_key()
+    if not api_key:
+        print("ERROR: Set VT_API_KEY in .env or the environment.", file=sys.stderr)
+        return 1
+    try:
+        iocs = read_iocs(settings.input_path)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: Could not read {settings.input_path}: {exc}", file=sys.stderr)
+        return 1
+    if not iocs:
+        print(f"ERROR: No IOCs found in {settings.input_path}.", file=sys.stderr)
+        return 1
+
+    summary = scan_iocs(iocs, settings, VirusTotalClient(api_key))
+    if summary.rate_limited_retry_after is not None:
+        print(
+            f"ERROR: VirusTotal rate limited this scan; retry after {summary.rate_limited_retry_after} seconds.\n"
+            f"Partial results written to {summary.output_path}",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"Done. {summary.api_calls} API call(s), {summary.cached_count} cached, {summary.invalid_count} invalid.")
+    print(f"Results written to {summary.output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
